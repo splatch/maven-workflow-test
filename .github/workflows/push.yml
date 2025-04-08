@@ -1,0 +1,85 @@
+name: Maven build
+
+on:
+  push:
+    branches: [ master ]
+
+jobs:
+
+  build:
+    permissions:
+      checks: write
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: connectorio/gh-actions-shared/.github/actions/github-debug-action@master
+        id: github-debug
+        if: runner.debug
+      - uses: connectorio/gh-actions-shared/.github/actions/setup-java@master
+        id: setup
+        with:
+          java_version: 17
+          server_id: foo
+      - id: debug-secrets
+        env:
+          SECRETS_VARS: ${{ toJson(secrets) }}
+        run: echo "$SECRETS_VARS"
+      - uses: connectorio/gh-actions-shared/.github/actions/maven-cache@master
+        with:
+          key: ${{ hashFiles('**/pom.xml') }}
+      - name: 'Calculate PR version'
+        if: github.event_name == 'pull_request'
+        shell: 'bash'
+        run: |
+          profiles='${{ inputs.additional_profiles && format('-P {0},cicd', inputs.additional_profiles) || '-Pcicd' }}';
+          baseVersion=$(mvn org.apache.maven.plugins:maven-help-plugin:3.4.0:evaluate -Dexpression=project.version -q -DforceStdout $profiles -Dcicd=true)
+          pullRequestId="pr-${{ github.event.pull_request.number }}"
+          mvn versions:set -DnewVersion=${baseVersion//-/"-$pullRequestId-"} $profiles -Dcicd=true
+      - name: 'Dump build environment for debug purposes'
+        id: env-debug
+        if: runner.debug
+        shell: 'sh'
+        run: >
+          cat ~/.m2/settings.xml && env
+        env:
+          ${{ steps.setup.outputs.ENV_SERVER_USERNAME }}: ${{ secrets.CI_DEPLOY_USERNAME }}
+          ${{ steps.setup.outputs.ENV_SERVER_PASSWORD }}: ${{ secrets.CI_DEPLOY_PASSWORD }}
+      - name: 'Build with Maven'
+        shell: 'sh'
+        run: >-
+          mvn -B -fae clean verify -Dcicd=true
+          ${{ inputs.additional_profiles && format('-P {0},cicd', inputs.additional_profiles) || '-Pcicd' }}
+          ${{ runner.debug && '-X' || '' }} && ls -la target/
+        env:
+          ${{ steps.setup.outputs.ENV_SERVER_USERNAME }}: ${{ secrets.CI_DEPLOY_USERNAME }}
+          ${{ steps.setup.outputs.ENV_SERVER_PASSWORD }}: ${{ secrets.CI_DEPLOY_PASSWORD }}
+      - name: 'Maven Deploy'
+        if: ${{ success() }}
+        shell: 'sh'
+        run: >-
+          ls -la target/ && mvn -B -nsu deploy -Dcicd=true
+          -Dmaven.test.skip=true
+          -DretryFailedDeploymentCount=3
+          ${{ inputs.additional_profiles && format('-P {0}', inputs.additional_profiles) || '' }}
+          ${{ runner.debug && '-X' || '' }} || ls -la target/
+        env:
+          ${{ steps.setup.outputs.ENV_SERVER_USERNAME }}: ${{ secrets.CI_DEPLOY_USERNAME }}
+          ${{ steps.setup.outputs.ENV_SERVER_PASSWORD }}: ${{ secrets.CI_DEPLOY_PASSWORD }}
+      - name: 'Remove snapshots from local repository'
+        shell: sh
+        run: >-
+          find ~/.m2/repository -type d -name '-SNAPSHOT' -exec rm -rf {} \; -print
+      - name: 'Publish Test Report'
+        if: ${{ !inputs.skip_test_publish && (success() || failure()) }}
+        uses: scacap/action-surefire-report@v1
+      - name: 'Upload Test Report'
+        uses: actions/upload-artifact@v4
+        if: ${{ !inputs.skip_test_publish && (success() || failure()) }}
+        with:
+          name: 'java-test-report-${{ runner.os }}-java-${{ inputs.java_version }}'
+          path: |
+            **/surefire-reports/TEST-*.xml
+            **/failsafe-reports/TEST-*.xml
